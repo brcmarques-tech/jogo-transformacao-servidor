@@ -37,6 +37,7 @@ const banco = await (async () => {
       pck bytea not null, publicado timestamptz default now())`);
     await pool.query(`create table if not exists config (chave text primary key, valor text not null)`);
     await pool.query(`create table if not exists instalador_partes (n int primary key, dados bytea not null)`);
+    await pool.query(`create table if not exists arquivos_partes (arquivo text not null, n int not null, dados bytea not null, primary key (arquivo, n))`);
     return {
       async conta(id) {
         const r = await pool.query('select dados, save from contas where id = $1', [id]);
@@ -69,17 +70,17 @@ const banco = await (async () => {
           [versao, sha256, buf.length, buf]);
       },
       // o .exe vai em partes de até 8 MB (o servidor grátis tem pouca memória)
-      async partes() {
-        const r = await pool.query('select n, length(dados) t from instalador_partes order by n');
+      async partes(arquivo) {
+        const r = await pool.query('select n, length(dados) t from arquivos_partes where arquivo = $1 order by n', [arquivo]);
         return r.rows.map((x) => ({ n: x.n, t: Number(x.t) }));
       },
-      async parte(n) {
-        const r = await pool.query('select dados from instalador_partes where n = $1', [n]);
+      async parte(arquivo, n) {
+        const r = await pool.query('select dados from arquivos_partes where arquivo = $1 and n = $2', [arquivo, n]);
         return r.rows[0]?.dados || null;
       },
-      async gravarParte(n, buf) {
-        if (n === 0) await pool.query('delete from instalador_partes');
-        await pool.query('insert into instalador_partes (n, dados) values ($1, $2) on conflict (n) do update set dados = $2', [n, buf]);
+      async gravarParte(arquivo, n, buf) {
+        if (n === 0) await pool.query('delete from arquivos_partes where arquivo = $1', [arquivo]);
+        await pool.query('insert into arquivos_partes (arquivo, n, dados) values ($1, $2, $3) on conflict (arquivo, n) do update set dados = $3', [arquivo, n, buf]);
       },
       async segredo() {
         if (process.env.SEGREDO) return process.env.SEGREDO;
@@ -112,14 +113,14 @@ const banco = await (async () => {
       fs.writeFileSync(path.join(PASTA, 'jogo.pck'), buf);
       fs.writeFileSync(ARQ_V, JSON.stringify({ versao, sha256, tamanho: buf.length, publicado: new Date() }));
     },
-    async partes() {
-      const d = path.join(PASTA, 'instalador');
+    async partes(arquivo) {
+      const d = path.join(PASTA, 'instalador-' + arquivo);
       if (!fs.existsSync(d)) return [];
       return fs.readdirSync(d).map((x) => ({ n: Number(x), t: fs.statSync(path.join(d, x)).size })).sort((a, b) => a.n - b.n);
     },
-    async parte(n) { const p = path.join(PASTA, 'instalador', String(n)); return fs.existsSync(p) ? fs.readFileSync(p) : null; },
-    async gravarParte(n, buf) {
-      const d = path.join(PASTA, 'instalador');
+    async parte(arquivo, n) { const p = path.join(PASTA, 'instalador-' + arquivo, String(n)); return fs.existsSync(p) ? fs.readFileSync(p) : null; },
+    async gravarParte(arquivo, n, buf) {
+      const d = path.join(PASTA, 'instalador-' + arquivo);
       if (n === 0) fs.rmSync(d, { recursive: true, force: true });
       fs.mkdirSync(d, { recursive: true });
       fs.writeFileSync(path.join(d, String(n)), buf);
@@ -263,13 +264,18 @@ http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': pck.length });
       return res.end(pck);
     }
-    if (req.method === 'GET' && url === '/baixar') {   // o jogo (.zip com o .exe e o .pck; baixa uma vez, depois atualiza sozinho)
-      const partes = await banco.partes();
+    const ARQUIVOS = {   // o que cada link entrega (baixa uma vez; depois o jogo avisa/atualiza)
+      '/baixar': ['windows', 'application/zip', 'Jogo da Transformacao.zip'],
+      '/baixar-android': ['android', 'application/vnd.android.package-archive', 'Jogo da Transformacao.apk'],
+    };
+    if (req.method === 'GET' && ARQUIVOS[url]) {
+      const [arquivo, tipo, nome] = ARQUIVOS[url];
+      const partes = await banco.partes(arquivo);
       if (!partes.length) return responder(res, 404, { erro: 'sem_instalador' });
-      res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': partes.reduce((a, p) => a + p.t, 0),
-        'Content-Disposition': 'attachment; filename="Jogo da Transformacao.zip"' });
+      res.writeHead(200, { 'Content-Type': tipo, 'Content-Length': partes.reduce((a, p) => a + p.t, 0),
+        'Content-Disposition': 'attachment; filename="' + nome + '"' });
       for (const p of partes) {   // uma parte por vez na memória
-        const buf = await banco.parte(p.n);
+        const buf = await banco.parte(arquivo, p.n);
         if (!res.write(buf)) await new Promise((ok) => res.once('drain', ok));
       }
       return res.end();
@@ -286,9 +292,11 @@ http.createServer(async (req, res) => {
     if (req.method === 'POST' && url === '/admin/instalador') {
       if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
       const n = Number(req.headers['x-parte']);
+      const arquivo = String(req.headers['x-arquivo'] || 'windows');
       if (!Number.isInteger(n) || n < 0 || n > 64) return responder(res, 400, { erro: 'parte' });
+      if (!['windows', 'android'].includes(arquivo)) return responder(res, 400, { erro: 'arquivo' });
       const buf = await lerCorpo(req, 9 * 1024 * 1024);
-      await banco.gravarParte(n, buf);
+      await banco.gravarParte(arquivo, n, buf);
       return responder(res, 200, { parte: n, tamanho: buf.length });
     }
     if (req.method === 'POST' && url === '/admin/atualizacao') {
