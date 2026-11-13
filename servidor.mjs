@@ -263,11 +263,11 @@ http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': pck.length });
       return res.end(pck);
     }
-    if (req.method === 'GET' && url === '/baixar') {   // o .exe do jogo (só precisa baixar uma vez; depois atualiza sozinho)
+    if (req.method === 'GET' && url === '/baixar') {   // o jogo (.zip com o .exe e o .pck; baixa uma vez, depois atualiza sozinho)
       const partes = await banco.partes();
       if (!partes.length) return responder(res, 404, { erro: 'sem_instalador' });
-      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': partes.reduce((a, p) => a + p.t, 0),
-        'Content-Disposition': 'attachment; filename="Jogo da Transformacao.exe"' });
+      res.writeHead(200, { 'Content-Type': 'application/zip', 'Content-Length': partes.reduce((a, p) => a + p.t, 0),
+        'Content-Disposition': 'attachment; filename="Jogo da Transformacao.zip"' });
       for (const p of partes) {   // uma parte por vez na memória
         const buf = await banco.parte(p.n);
         if (!res.write(buf)) await new Promise((ok) => res.once('drain', ok));
