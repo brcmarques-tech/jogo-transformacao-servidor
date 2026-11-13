@@ -36,6 +36,7 @@ const banco = await (async () => {
       id int primary key, versao text not null, sha256 text not null, tamanho int not null,
       pck bytea not null, publicado timestamptz default now())`);
     await pool.query(`create table if not exists config (chave text primary key, valor text not null)`);
+    await pool.query(`create table if not exists instalador (id int primary key, nome text not null, exe bytea not null, publicado timestamptz default now())`);
     return {
       async conta(id) {
         const r = await pool.query('select dados, save from contas where id = $1', [id]);
@@ -66,6 +67,14 @@ const banco = await (async () => {
         await pool.query(`insert into atualizacao (id, versao, sha256, tamanho, pck) values (1, $1, $2, $3, $4)
           on conflict (id) do update set versao = $1, sha256 = $2, tamanho = $3, pck = $4, publicado = now()`,
           [versao, sha256, buf.length, buf]);
+      },
+      async instalador() {
+        const r = await pool.query('select nome, exe from instalador where id = 1');
+        return r.rows[0] || null;
+      },
+      async publicarInstalador(nome, buf) {
+        await pool.query(`insert into instalador (id, nome, exe) values (1, $1, $2)
+          on conflict (id) do update set nome = $1, exe = $2, publicado = now()`, [nome, buf]);
       },
       async segredo() {
         if (process.env.SEGREDO) return process.env.SEGREDO;
@@ -98,6 +107,8 @@ const banco = await (async () => {
       fs.writeFileSync(path.join(PASTA, 'jogo.pck'), buf);
       fs.writeFileSync(ARQ_V, JSON.stringify({ versao, sha256, tamanho: buf.length, publicado: new Date() }));
     },
+    async instalador() { const p = path.join(PASTA, 'instalador.exe'); return fs.existsSync(p) ? { nome: 'Jogo da Transformacao.exe', exe: fs.readFileSync(p) } : null; },
+    async publicarInstalador(nome, buf) { fs.writeFileSync(path.join(PASTA, 'instalador.exe'), buf); },
     async segredo() {
       if (process.env.SEGREDO) return process.env.SEGREDO;
       const s = path.join(PASTA, 'segredo.txt');
@@ -237,16 +248,30 @@ http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': pck.length });
       return res.end(pck);
     }
+    if (req.method === 'GET' && url === '/baixar') {   // o .exe do jogo (só precisa baixar uma vez; depois atualiza sozinho)
+      const i = await banco.instalador();
+      if (!i) return responder(res, 404, { erro: 'sem_instalador' });
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': i.exe.length,
+        'Content-Disposition': 'attachment; filename="' + i.nome + '"' });
+      return res.end(i.exe);
+    }
     if (req.method === 'GET' && (url === '/' || url === '/saude')) {
       return responder(res, 200, { ok: true, jogo: 'Jogo da Transformação' });
     }
     // ---- publicar versão nova (só com o segredo ADMIN)
-    if (req.method === 'POST' && url === '/admin/atualizacao') {
+    const ehAdmin = () => {
       const admin = process.env.ADMIN || '';
       const veio = String(req.headers['x-admin'] || '');
-      if (!admin || veio.length !== admin.length || !crypto.timingSafeEqual(Buffer.from(veio), Buffer.from(admin))) {
-        return responder(res, 403, { erro: 'admin' });
-      }
+      return admin !== '' && veio.length === admin.length && crypto.timingSafeEqual(Buffer.from(veio), Buffer.from(admin));
+    };
+    if (req.method === 'POST' && url === '/admin/instalador') {
+      if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
+      const buf = await lerCorpo(req, MAX_PCK);
+      await banco.publicarInstalador('Jogo da Transformacao.exe', buf);
+      return responder(res, 200, { tamanho: buf.length });
+    }
+    if (req.method === 'POST' && url === '/admin/atualizacao') {
+      if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
       const versao = String(req.headers['x-versao'] || '');
       if (!/^[0-9]+(\.[0-9]+)*$/.test(versao)) return responder(res, 400, { erro: 'versao' });
       const buf = await lerCorpo(req, MAX_PCK);
