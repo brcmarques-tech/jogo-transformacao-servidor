@@ -62,6 +62,16 @@ function errouIp(ip) {
   r.n++; porIp.set(ip, r);
 }
 
+// consultas e cadastros por IP (contra varrer CPFs e criar contas em massa)
+const consultas = new Map();
+function excedeu(ip, tipo, max) {
+  const k = tipo + '|' + ip;
+  const r = consultas.get(k);
+  if (!r || Date.now() - r.desde > 3600_000) { consultas.set(k, { n: 1, desde: Date.now() }); return false; }
+  r.n++;
+  return r.n > max;
+}
+
 function sessaoDe(corpo) {
   if (!valido(corpo.token)) return null;
   const h = hashToken(corpo.token);
@@ -71,13 +81,15 @@ function sessaoDe(corpo) {
 
 const rotas = {
   // a conta existe? (o jogo decide se pede "digite o PIN" ou "crie um PIN")
-  '/conta/existe': (b) => {
+  '/conta/existe': (b, ip) => {
     if (!valido(b.conta)) return [400, { erro: 'conta' }];
+    if (excedeu(ip, 'existe', 60)) return [429, { erro: 'muitas_tentativas', minutos: 60 }];
     return [200, { existe: !!contas[idDa(b.conta)] }];
   },
 
-  '/conta/registrar': (b) => {
+  '/conta/registrar': (b, ip) => {
     if (!valido(b.conta) || !valido(b.verificador)) return [400, { erro: 'dados' }];
+    if (excedeu(ip, 'registrar', 5)) return [429, { erro: 'muitas_tentativas', minutos: 60 }];
     const id = idDa(b.conta);
     if (contas[id]) return [409, { erro: 'ja_existe' }];
     const sal = crypto.randomBytes(16);
