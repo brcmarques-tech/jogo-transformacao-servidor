@@ -268,7 +268,9 @@ http.createServer(async (req, res) => {
   }
 }).listen(PORTA, () => console.log(`servidor do jogo na porta ${PORTA} (${process.env.DATABASE_URL ? 'Postgres' : 'arquivos'})`));
 
-// Render grátis dorme sem acesso: o próprio servidor se chama a cada 10 min pela URL pública.
-if (process.env.RENDER_EXTERNAL_URL) {
+// Render grátis dorme sem acesso. Com MANTER_ACORDADO=1 o próprio servidor se chama a cada 10 min
+// (gasta as 750 h grátis do workspace inteiro; por padrão fica desligado: os dados estão no Postgres,
+// dormir só deixa o primeiro login mais lento).
+if (process.env.RENDER_EXTERNAL_URL && process.env.MANTER_ACORDADO === "1") {
   setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL + '/saude').catch(() => {}); }, 10 * 60 * 1000);
 }
