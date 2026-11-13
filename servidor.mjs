@@ -1,38 +1,113 @@
-// Servidor de contas do Jogo da Transformação (Node 22+, sem dependências).
+// Servidor de contas e de atualização do Jogo da Transformação (Node 22+).
 //
 // O que ele NÃO sabe: o CPF (chega só um hash feito no jogo, que aqui ainda passa por um HMAC com
-// segredo do servidor), o PIN (chega um verificador derivado dele, que aqui é guardado com scrypt) e
-// os dados do jogo (chegam cifrados com uma chave que só existe no aparelho do jogador).
+// segredo do servidor), o PIN (chega um verificador derivado dele, guardado com scrypt) e os dados
+// do jogo (chegam cifrados com uma chave que só existe no aparelho do jogador).
 //
 // Uma conta, um lugar por vez: entrar gera uma sessão nova e derruba a anterior (o jogo antigo
 // recebe 401 "outro_lugar" no próximo pulso e fecha com aviso).
 //
-// Uso: node servidor/servidor.mjs   (porta pela variável PORTA, padrão 8787)
+// Atualização: o jogo pergunta GET /atualizacao e baixa GET /atualizacao/jogo.pck quando há versão
+// nova. Publicar uma versão: POST /admin/atualizacao com o cabeçalho "x-admin" (segredo ADMIN).
+//
+// Guarda: Postgres (DATABASE_URL, ex.: Neon) — ou, sem ela, arquivos em servidor/dados (teste local).
+// Variáveis: PORT/PORTA, DATABASE_URL, SEGREDO (HMAC do CPF), ADMIN (publicar versão), DADOS (pasta local).
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const PASTA = process.env.DADOS || path.join(path.dirname(fileURLToPath(import.meta.url)), 'dados');
-const ARQ_CONTAS = path.join(PASTA, 'contas.json');
-const ARQ_SEGREDO = path.join(PASTA, 'segredo.txt');
-const PORTA = Number(process.env.PORTA || 8787);
-const MAX_SAVE = 8 * 1024 * 1024;          // 8 MB de save cifrado
+const PORTA = Number(process.env.PORT || process.env.PORTA || 8787);
+const MAX_SAVE = 8 * 1024 * 1024;           // 8 MB de save cifrado
+const MAX_PCK = 200 * 1024 * 1024;          // pacote do jogo
 const ERROS_ATE_BLOQUEAR = 5;
 const BLOQUEIO_MIN = 15;
 
-fs.mkdirSync(PASTA, { recursive: true });
-if (!fs.existsSync(ARQ_SEGREDO)) fs.writeFileSync(ARQ_SEGREDO, crypto.randomBytes(32).toString('hex'));
-const SEGREDO = process.env.SEGREDO || fs.readFileSync(ARQ_SEGREDO, 'utf8').trim();
+// ------------------------------------------------------------------ guarda (Postgres ou arquivo)
 
-let contas = fs.existsSync(ARQ_CONTAS) ? JSON.parse(fs.readFileSync(ARQ_CONTAS, 'utf8')) : {};
-function gravar() {
-  const tmp = ARQ_CONTAS + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(contas));
-  fs.renameSync(tmp, ARQ_CONTAS);
-}
+const banco = await (async () => {
+  if (process.env.DATABASE_URL) {
+    const { default: pg } = await import('pg');
+    const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 4 });
+    await pool.query(`create table if not exists contas (
+      id text primary key, dados jsonb not null, save text, atualizado timestamptz default now())`);
+    await pool.query(`create table if not exists atualizacao (
+      id int primary key, versao text not null, sha256 text not null, tamanho int not null,
+      pck bytea not null, publicado timestamptz default now())`);
+    await pool.query(`create table if not exists config (chave text primary key, valor text not null)`);
+    return {
+      async conta(id) {
+        const r = await pool.query('select dados, save from contas where id = $1', [id]);
+        return r.rows[0] ? { ...r.rows[0].dados, save: r.rows[0].save } : null;
+      },
+      async gravar(id, c) {
+        const { save, ...dados } = c;
+        await pool.query(`insert into contas (id, dados, save) values ($1, $2, $3)
+          on conflict (id) do update set dados = $2, save = $3, atualizado = now()`, [id, dados, save ?? null]);
+      },
+      async gravarDados(id, c) {   // sem mexer no save (sessão, erros de PIN)
+        const { save, ...dados } = c;
+        await pool.query('update contas set dados = $2 where id = $1', [id, dados]);
+      },
+      async porSessao(h) {
+        const r = await pool.query("select id, dados from contas where dados->>'sessao' = $1", [h]);
+        return r.rows[0] ? [r.rows[0].id, r.rows[0].dados] : null;
+      },
+      async versao() {
+        const r = await pool.query('select versao, sha256, tamanho, publicado from atualizacao where id = 1');
+        return r.rows[0] || null;
+      },
+      async pck() {
+        const r = await pool.query('select pck from atualizacao where id = 1');
+        return r.rows[0]?.pck || null;
+      },
+      async publicar(versao, sha256, buf) {
+        await pool.query(`insert into atualizacao (id, versao, sha256, tamanho, pck) values (1, $1, $2, $3, $4)
+          on conflict (id) do update set versao = $1, sha256 = $2, tamanho = $3, pck = $4, publicado = now()`,
+          [versao, sha256, buf.length, buf]);
+      },
+      async segredo() {
+        if (process.env.SEGREDO) return process.env.SEGREDO;
+        const r = await pool.query("select valor from config where chave = 'segredo'");
+        if (r.rows[0]) return r.rows[0].valor;
+        const novo = crypto.randomBytes(32).toString('hex');
+        await pool.query("insert into config (chave, valor) values ('segredo', $1) on conflict do nothing", [novo]);
+        return (await pool.query("select valor from config where chave = 'segredo'")).rows[0].valor;
+      },
+    };
+  }
+  // teste local: arquivos
+  const PASTA = process.env.DADOS || path.join(path.dirname(fileURLToPath(import.meta.url)), 'dados');
+  fs.mkdirSync(PASTA, { recursive: true });
+  const ARQ = path.join(PASTA, 'contas.json');
+  const contas = fs.existsSync(ARQ) ? JSON.parse(fs.readFileSync(ARQ, 'utf8')) : {};
+  const salvarArq = () => { fs.writeFileSync(ARQ + '.tmp', JSON.stringify(contas)); fs.renameSync(ARQ + '.tmp', ARQ); };
+  const ARQ_V = path.join(PASTA, 'atualizacao.json');
+  return {
+    async conta(id) { return contas[id] ? { ...contas[id] } : null; },
+    async gravar(id, c) { contas[id] = { ...c }; salvarArq(); },
+    async gravarDados(id, c) { contas[id] = { ...c, save: contas[id]?.save ?? null }; salvarArq(); },
+    async porSessao(h) {
+      for (const [id, c] of Object.entries(contas)) if (c.sessao === h) return [id, c];
+      return null;
+    },
+    async versao() { return fs.existsSync(ARQ_V) ? JSON.parse(fs.readFileSync(ARQ_V, 'utf8')) : null; },
+    async pck() { const p = path.join(PASTA, 'jogo.pck'); return fs.existsSync(p) ? fs.readFileSync(p) : null; },
+    async publicar(versao, sha256, buf) {
+      fs.writeFileSync(path.join(PASTA, 'jogo.pck'), buf);
+      fs.writeFileSync(ARQ_V, JSON.stringify({ versao, sha256, tamanho: buf.length, publicado: new Date() }));
+    },
+    async segredo() {
+      if (process.env.SEGREDO) return process.env.SEGREDO;
+      const s = path.join(PASTA, 'segredo.txt');
+      if (!fs.existsSync(s)) fs.writeFileSync(s, crypto.randomBytes(32).toString('hex'));
+      return fs.readFileSync(s, 'utf8').trim();
+    },
+  };
+})();
 
+const SEGREDO = await banco.segredo();
 const idDa = (conta) => crypto.createHmac('sha256', SEGREDO).update(String(conta)).digest('hex');
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const valido = (s, n = 64) => typeof s === 'string' && /^[0-9a-f]+$/.test(s) && s.length === n;
@@ -49,122 +124,151 @@ function novaSessao(c) {
   return token;
 }
 
-// tentativas erradas por IP (além do bloqueio por conta)
+// limites por IP (contra adivinhar PIN, varrer CPFs e criar contas em massa)
 const porIp = new Map();
-function ipBloqueado(ip) {
-  const r = porIp.get(ip);
-  if (!r) return false;
-  if (Date.now() - r.desde > 3600_000) { porIp.delete(ip); return false; }
-  return r.n >= 30;
-}
-function errouIp(ip) {
-  const r = porIp.get(ip) || { n: 0, desde: Date.now() };
-  r.n++; porIp.set(ip, r);
-}
-
-// consultas e cadastros por IP (contra varrer CPFs e criar contas em massa)
-const consultas = new Map();
-function excedeu(ip, tipo, max) {
+function conta_ip(ip, tipo) {
   const k = tipo + '|' + ip;
-  const r = consultas.get(k);
-  if (!r || Date.now() - r.desde > 3600_000) { consultas.set(k, { n: 1, desde: Date.now() }); return false; }
-  r.n++;
-  return r.n > max;
+  const r = porIp.get(k);
+  if (!r || Date.now() - r.desde > 3600_000) { const novo = { n: 0, desde: Date.now() }; porIp.set(k, novo); return novo; }
+  return r;
+}
+function excedeu(ip, tipo, max) { const r = conta_ip(ip, tipo); r.n++; return r.n > max; }
+function ipDe(req) {   // atrás do proxy do Render, o IP real vem no x-forwarded-for
+  return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 }
 
-function sessaoDe(corpo) {
+async function sessaoDe(corpo) {
   if (!valido(corpo.token)) return null;
-  const h = hashToken(corpo.token);
-  for (const [id, c] of Object.entries(contas)) if (c.sessao === h) return [id, c];
-  return null;
+  return banco.porSessao(hashToken(corpo.token));
 }
 
 const rotas = {
-  // a conta existe? (o jogo decide se pede "digite o PIN" ou "crie um PIN")
-  '/conta/existe': (b, ip) => {
+  '/conta/existe': async (b, ip) => {
     if (!valido(b.conta)) return [400, { erro: 'conta' }];
     if (excedeu(ip, 'existe', 60)) return [429, { erro: 'muitas_tentativas', minutos: 60 }];
-    return [200, { existe: !!contas[idDa(b.conta)] }];
+    return [200, { existe: !!(await banco.conta(idDa(b.conta))) }];
   },
 
-  '/conta/registrar': (b, ip) => {
+  '/conta/registrar': async (b, ip) => {
     if (!valido(b.conta) || !valido(b.verificador)) return [400, { erro: 'dados' }];
     if (excedeu(ip, 'registrar', 5)) return [429, { erro: 'muitas_tentativas', minutos: 60 }];
     const id = idDa(b.conta);
-    if (contas[id]) return [409, { erro: 'ja_existe' }];
+    if (await banco.conta(id)) return [409, { erro: 'ja_existe' }];
     const sal = crypto.randomBytes(16);
-    contas[id] = { sal: sal.toString('hex'), verif: crypto.scryptSync(b.verificador, sal, 32).toString('hex'),
+    const c = { sal: sal.toString('hex'), verif: crypto.scryptSync(b.verificador, sal, 32).toString('hex'),
       criada: Date.now(), save: null, versao: 0, erros: 0, bloqueada_ate: 0 };
-    const token = novaSessao(contas[id]);
-    gravar();
+    const token = novaSessao(c);
+    await banco.gravar(id, c);
     return [200, { token, nova: true }];
   },
 
-  '/conta/entrar': (b, ip) => {
+  '/conta/entrar': async (b, ip) => {
     if (!valido(b.conta) || !valido(b.verificador)) return [400, { erro: 'dados' }];
-    if (ipBloqueado(ip)) return [429, { erro: 'muitas_tentativas', minutos: 60 }];
-    const c = contas[idDa(b.conta)];
+    if (conta_ip(ip, 'pin_errado').n >= 30) return [429, { erro: 'muitas_tentativas', minutos: 60 }];
+    const id = idDa(b.conta);
+    const c = await banco.conta(id);
     if (!c) return [404, { erro: 'nao_existe' }];
     if (c.bloqueada_ate > Date.now()) return [429, { erro: 'muitas_tentativas', minutos: Math.ceil((c.bloqueada_ate - Date.now()) / 60000) }];
     if (!verificar(c, b.verificador)) {
-      errouIp(ip);
-      c.erros++;
+      conta_ip(ip, 'pin_errado').n++;
+      c.erros = (c.erros || 0) + 1;
       if (c.erros >= ERROS_ATE_BLOQUEAR) { c.bloqueada_ate = Date.now() + BLOQUEIO_MIN * 60000 * (c.erros - ERROS_ATE_BLOQUEAR + 1); }
-      gravar();
+      await banco.gravarDados(id, c);
       return [401, { erro: 'pin', restam: Math.max(0, ERROS_ATE_BLOQUEAR - c.erros) }];
     }
     c.erros = 0; c.bloqueada_ate = 0;
     const derrubou = !!c.sessao;
     const token = novaSessao(c);   // a sessão anterior (outro aparelho) deixa de valer
-    gravar();
+    await banco.gravarDados(id, c);
     return [200, { token, save: c.save, versao: c.versao, derrubou }];
   },
 
   // pulso: a sessão ainda é minha?
-  '/sessao': (b) => (sessaoDe(b) ? [200, { ok: true }] : [401, { erro: 'outro_lugar' }]),
+  '/sessao': async (b) => ((await sessaoDe(b)) ? [200, { ok: true }] : [401, { erro: 'outro_lugar' }]),
 
-  '/save': (b) => {
-    const s = sessaoDe(b);
+  '/save': async (b) => {
+    const s = await sessaoDe(b);
     if (!s) return [401, { erro: 'outro_lugar' }];
     if (typeof b.save !== 'string' || b.save.length > MAX_SAVE) return [400, { erro: 'save' }];
-    s[1].save = b.save;
-    s[1].versao = (s[1].versao || 0) + 1;
-    s[1].salvo_em = Date.now();
-    gravar();
-    return [200, { versao: s[1].versao }];
+    const c = await banco.conta(s[0]);
+    c.save = b.save;
+    c.versao = (c.versao || 0) + 1;
+    c.salvo_em = Date.now();
+    await banco.gravar(s[0], c);
+    return [200, { versao: c.versao }];
   },
 
-  '/sair': (b) => {
-    const s = sessaoDe(b);
-    if (s) { s[1].sessao = null; gravar(); }
+  '/sair': async (b) => {
+    const s = await sessaoDe(b);
+    if (s) { const c = s[1]; c.sessao = null; await banco.gravarDados(s[0], c); }
     return [200, { ok: true }];
   },
 };
 
-http.createServer((req, res) => {
-  const responder = (cod, obj) => {
-    res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify(obj));
-  };
-  const rota = rotas[req.url];
-  if (req.method !== 'POST' || !rota) return responder(404, { erro: 'rota' });
-  let tam = 0;
-  const partes = [];
-  req.on('data', (p) => {
-    tam += p.length;
-    if (tam > MAX_SAVE + 4096) { responder(413, { erro: 'grande' }); req.destroy(); }
-    else partes.push(p);
+function responder(res, cod, obj) {
+  res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+
+function lerCorpo(req, max) {
+  return new Promise((ok, falha) => {
+    let tam = 0;
+    const partes = [];
+    req.on('data', (p) => {
+      tam += p.length;
+      if (tam > max) { falha(new Error('grande')); req.destroy(); } else partes.push(p);
+    });
+    req.on('end', () => ok(Buffer.concat(partes)));
+    req.on('error', falha);
   });
-  req.on('end', () => {
-    if (res.writableEnded) return;
-    let corpo;
-    try { corpo = JSON.parse(Buffer.concat(partes).toString('utf8') || '{}'); } catch { return responder(400, { erro: 'json' }); }
-    try {
-      const [cod, obj] = rota(corpo, req.socket.remoteAddress);
-      responder(cod, obj);
-    } catch (e) {
-      console.error(e);
-      responder(500, { erro: 'interno' });
+}
+
+http.createServer(async (req, res) => {
+  try {
+    const url = req.url.split('?')[0];
+    // ---- atualização do jogo (público)
+    if (req.method === 'GET' && url === '/atualizacao') {
+      const v = await banco.versao();
+      return responder(res, 200, v ? { versao: v.versao, sha256: v.sha256, tamanho: v.tamanho } : { versao: '' });
     }
-  });
-}).listen(PORTA, () => console.log(`servidor de contas na porta ${PORTA}`));
+    if (req.method === 'GET' && url === '/atualizacao/jogo.pck') {
+      const pck = await banco.pck();
+      if (!pck) return responder(res, 404, { erro: 'sem_versao' });
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': pck.length });
+      return res.end(pck);
+    }
+    if (req.method === 'GET' && (url === '/' || url === '/saude')) {
+      return responder(res, 200, { ok: true, jogo: 'Jogo da Transformação' });
+    }
+    // ---- publicar versão nova (só com o segredo ADMIN)
+    if (req.method === 'POST' && url === '/admin/atualizacao') {
+      const admin = process.env.ADMIN || '';
+      const veio = String(req.headers['x-admin'] || '');
+      if (!admin || veio.length !== admin.length || !crypto.timingSafeEqual(Buffer.from(veio), Buffer.from(admin))) {
+        return responder(res, 403, { erro: 'admin' });
+      }
+      const versao = String(req.headers['x-versao'] || '');
+      if (!/^[0-9]+(\.[0-9]+)*$/.test(versao)) return responder(res, 400, { erro: 'versao' });
+      const buf = await lerCorpo(req, MAX_PCK);
+      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+      await banco.publicar(versao, sha256, buf);
+      return responder(res, 200, { versao, sha256, tamanho: buf.length });
+    }
+    // ---- contas
+    const rota = rotas[url];
+    if (req.method !== 'POST' || !rota) return responder(res, 404, { erro: 'rota' });
+    let corpo;
+    try { corpo = JSON.parse((await lerCorpo(req, MAX_SAVE + 4096)).toString('utf8') || '{}'); }
+    catch (e) { return responder(res, e.message === 'grande' ? 413 : 400, { erro: e.message === 'grande' ? 'grande' : 'json' }); }
+    const [cod, obj] = await rota(corpo, ipDe(req));
+    responder(res, cod, obj);
+  } catch (e) {
+    console.error(e);
+    if (!res.headersSent) responder(res, 500, { erro: 'interno' });
+  }
+}).listen(PORTA, () => console.log(`servidor do jogo na porta ${PORTA} (${process.env.DATABASE_URL ? 'Postgres' : 'arquivos'})`));
+
+// Render grátis dorme sem acesso: o próprio servidor se chama a cada 10 min pela URL pública.
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL + '/saude').catch(() => {}); }, 10 * 60 * 1000);
+}
