@@ -11,7 +11,8 @@
 // nova. Publicar uma versão: POST /admin/atualizacao com o cabeçalho "x-admin" (segredo ADMIN).
 //
 // Guarda: Postgres (DATABASE_URL, ex.: Neon) — ou, sem ela, arquivos em servidor/dados (teste local).
-// Variáveis: PORT/PORTA, DATABASE_URL, SEGREDO (HMAC do CPF), ADMIN (publicar versão), DADOS (pasta local).
+// Variáveis: PORT/PORTA, DATABASE_URL, SEGREDO (HMAC do CPF), ADMIN (publicar versão), DADOS (pasta local),
+// GEMINI_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY (IA do diário: tenta nessa ordem), IA_POR_DIA (limite por conta).
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -23,6 +24,61 @@ const MAX_SAVE = 8 * 1024 * 1024;           // 8 MB de save cifrado
 const MAX_PCK = 200 * 1024 * 1024;          // pacote do jogo
 const ERROS_ATE_BLOQUEAR = 5;
 const BLOQUEIO_MIN = 15;
+const IA_POR_DIA = Number(process.env.IA_POR_DIA || 8);
+const MAX_IA_TEXTO = 80 * 1024;
+
+// ------------------------------------------------------------------ IA (as chaves nunca saem daqui)
+
+async function comTempo(url, opcoes, ms = 45000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { ...opcoes, signal: ctl.signal }); } finally { clearTimeout(t); }
+}
+
+const PROVEDORES = [
+  ['gemini', async (sistema, texto) => {
+    if (!process.env.GEMINI_API_KEY) return null;
+    for (const modelo of ['gemini-flash-latest', 'gemini-3.8-flash']) {
+      const r = await comTempo(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+        body: JSON.stringify({ system_instruction: { parts: [{ text: sistema }] }, contents: [{ role: 'user', parts: [{ text: texto }] }],
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1500 } }) });
+      if (!r.ok) continue;
+      const j = await r.json();
+      const out = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+      if (out) return out;
+    }
+    return null;
+  }],
+  ['anthropic', async (sistema, texto) => {
+    if (!process.env.ANTHROPIC_API_KEY) return null;
+    const r = await comTempo('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 1200, system: sistema, messages: [{ role: 'user', content: texto }] }) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j.content || []).map((c) => c.text || '').join('').trim() || null;
+  }],
+  ['openai', async (sistema, texto) => {
+    if (!process.env.OPENAI_API_KEY) return null;
+    const r = await comTempo('https://api.openai.com/v1/chat/completions', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.OPENAI_API_KEY },
+      body: JSON.stringify({ model: 'gpt-4o-mini', max_tokens: 1200, messages: [{ role: 'system', content: sistema }, { role: 'user', content: texto }] }) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j.choices?.[0]?.message?.content?.trim() || null;
+  }],
+];
+
+async function perguntarIA(sistema, texto) {
+  for (const [nome, chamar] of PROVEDORES) {
+    try {
+      const out = await chamar(sistema, texto);
+      if (out) return [nome, out];
+    } catch (e) { console.error('ia', nome, e.message); }
+  }
+  return [null, null];
+}
 
 // ------------------------------------------------------------------ guarda (Postgres ou arquivo)
 
@@ -223,6 +279,25 @@ const rotas = {
     c.salvo_em = Date.now();
     await banco.gravar(s[0], c);
     return [200, { versao: c.versao }];
+  },
+
+  // análise do dia: só logado, limite por conta por dia
+  '/ia': async (b, ip) => {
+    const s = await sessaoDe(b);
+    if (!s) return [401, { erro: 'sessao' }];
+    if (typeof b.sistema !== 'string' || typeof b.texto !== 'string' || b.texto.length > MAX_IA_TEXTO || b.sistema.length > 8000) {
+      return [400, { erro: 'dados' }];
+    }
+    if (excedeu(ip, 'ia', IA_POR_DIA * 3)) return [429, { erro: 'limite', por_dia: IA_POR_DIA }];
+    const c = s[1];
+    const hoje = new Date().toISOString().slice(0, 10);
+    if (c.ia_dia !== hoje) { c.ia_dia = hoje; c.ia_n = 0; }
+    if (c.ia_n >= IA_POR_DIA) return [429, { erro: 'limite', por_dia: IA_POR_DIA }];
+    const [provedor, texto] = await perguntarIA(b.sistema, b.texto);
+    if (!texto) return [502, { erro: 'ia_indisponivel' }];
+    c.ia_n = (c.ia_n || 0) + 1;
+    await banco.gravarDados(s[0], c);
+    return [200, { texto, provedor, restam: IA_POR_DIA - c.ia_n }];
   },
 
   '/sair': async (b) => {
