@@ -42,11 +42,12 @@ const PROVEDORES = [
       const r = await comTempo(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
         body: JSON.stringify({ system_instruction: { parts: [{ text: sistema }] }, contents: [{ role: 'user', parts: [{ text: texto }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 1500 } }) });
+          generationConfig: { temperature: 0.7, maxOutputTokens: 4096 } }) });
       if (!r.ok) continue;
       const j = await r.json();
-      const out = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
-      if (out) return out;
+      const cand = j.candidates?.[0];
+      const out = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('').trim();
+      if (out && cand?.finishReason !== 'MAX_TOKENS') return out;   // cortada no meio: tenta o próximo
     }
     return null;
   }],
