@@ -139,6 +139,13 @@ const banco = await (async () => {
         if (n === 0) await pool.query('delete from arquivos_partes where arquivo = $1', [arquivo]);
         await pool.query('insert into arquivos_partes (arquivo, n, dados) values ($1, $2, $3) on conflict (arquivo, n) do update set dados = $3', [arquivo, n, buf]);
       },
+      async config(chave) {
+        const r = await pool.query('select valor from config where chave = $1', [chave]);
+        return r.rows[0]?.valor ?? null;
+      },
+      async definirConfig(chave, valor) {
+        await pool.query('insert into config (chave, valor) values ($1, $2) on conflict (chave) do update set valor = $2', [chave, valor]);
+      },
       async segredo() {
         if (process.env.SEGREDO) return process.env.SEGREDO;
         const r = await pool.query("select valor from config where chave = 'segredo'");
@@ -181,6 +188,16 @@ const banco = await (async () => {
       if (n === 0) fs.rmSync(d, { recursive: true, force: true });
       fs.mkdirSync(d, { recursive: true });
       fs.writeFileSync(path.join(d, String(n)), buf);
+    },
+    async config(chave) {
+      const a = path.join(PASTA, 'config.json');
+      return fs.existsSync(a) ? (JSON.parse(fs.readFileSync(a, 'utf8'))[chave] ?? null) : null;
+    },
+    async definirConfig(chave, valor) {
+      const a = path.join(PASTA, 'config.json');
+      const c = fs.existsSync(a) ? JSON.parse(fs.readFileSync(a, 'utf8')) : {};
+      c[chave] = valor;
+      fs.writeFileSync(a, JSON.stringify(c));
     },
     async segredo() {
       if (process.env.SEGREDO) return process.env.SEGREDO;
@@ -332,7 +349,8 @@ http.createServer(async (req, res) => {
     // ---- atualização do jogo (público)
     if (req.method === 'GET' && url === '/atualizacao') {
       const v = await banco.versao();
-      return responder(res, 200, v ? { versao: v.versao, sha256: v.sha256, tamanho: v.tamanho } : { versao: '' });
+      const android = (await banco.config('versao_android')) || '';   // versão do .apk publicado (pode ser mais velha que o pacote)
+      return responder(res, 200, v ? { versao: v.versao, sha256: v.sha256, tamanho: v.tamanho, versao_android: android } : { versao: '', versao_android: android });
     }
     if (req.method === 'GET' && url === '/atualizacao/jogo.pck') {
       const pck = await banco.pck();
@@ -373,6 +391,8 @@ http.createServer(async (req, res) => {
       if (!['windows', 'android'].includes(arquivo)) return responder(res, 400, { erro: 'arquivo' });
       const buf = await lerCorpo(req, 9 * 1024 * 1024);
       await banco.gravarParte(arquivo, n, buf);
+      const versao = String(req.headers['x-versao'] || '');
+      if (n === 0 && /^[0-9]+(\.[0-9]+)*$/.test(versao)) await banco.definirConfig('versao_' + arquivo, versao);
       return responder(res, 200, { parte: n, tamanho: buf.length });
     }
     if (req.method === 'POST' && url === '/admin/atualizacao') {
