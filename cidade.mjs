@@ -285,7 +285,7 @@ export function montarCidade({ banco, sessaoDe, excedeu }) {
       try { m = JSON.parse(dados.toString('utf8')); } catch { return; }
       if (m.t === 'pos') {
         const pos = { cena: String(m.cena || '').slice(0, 20), dono: String(m.dono || '').slice(0, 12),
-          x: Number(m.x) || 0, at: String(m.at || '').slice(0, 30), olha: m.olha === -1 ? -1 : 1, ctl: !!m.ctl };
+          x: Number(m.x) || 0, y: Number(m.y) || 0, esc: Number(m.esc) || 1, at: String(m.at || '').slice(0, 30), olha: m.olha === -1 ? -1 : 1, ctl: !!m.ctl };
         const a = aoVivo.get(ws.pid);
         if (a?.ws === ws) a.pos = pos;
         espalhar(ws.sala, { t: 'pos', pid: ws.pid, ...pos }, ws);
