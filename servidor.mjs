@@ -416,6 +416,15 @@ const rotas = {
 const cidade = montarCidade({ banco, sessaoDe, excedeu });
 Object.assign(rotas, cidade.rotas);
 
+// "48" < "49", "1.10" > "1.9"
+function versaoMenor(a, b) {
+  const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0);
+  }
+  return false;
+}
+
 function responder(res, cod, obj) {
   res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -441,6 +450,12 @@ http.createServer(async (req, res) => {
     if (req.method === 'GET' && url === '/atualizacao') {
       const v = await banco.versao();
       const android = (await banco.config('versao_android')) || '';   // versão do .apk publicado (pode ser mais velha que o pacote)
+      // Pacote que precisa de APK novo (ex.: autoload novo): celular com APK mais velho não baixa o pacote,
+      // só recebe o aviso do APK. O jogo novo manda ?apk=<versão do APK>; o antigo não manda nada.
+      const minimo = (await banco.config('apk_minimo')) || '';
+      const ehAndroid = /android/i.test(String(req.headers['user-agent'] || ''));
+      const apk = new URL(req.url, 'http://x').searchParams.get('apk') || '0';
+      if (v && ehAndroid && minimo && versaoMenor(apk, minimo)) return responder(res, 200, { versao: '', versao_android: android });
       return responder(res, 200, v ? { versao: v.versao, sha256: v.sha256, tamanho: v.tamanho, versao_android: android } : { versao: '', versao_android: android });
     }
     if (req.method === 'GET' && url === '/atualizacao/jogo.pck') {
@@ -493,6 +508,8 @@ http.createServer(async (req, res) => {
       const buf = await lerCorpo(req, MAX_PCK);
       const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
       await banco.publicar(versao, sha256, buf);
+      const minimo = String(req.headers['x-apk-minimo'] || '');
+      if (/^[0-9]+(\.[0-9]+)*$/.test(minimo)) await banco.definirConfig('apk_minimo', minimo);
       return responder(res, 200, { versao, sha256, tamanho: buf.length });
     }
     // ---- voz da análise (binário)
