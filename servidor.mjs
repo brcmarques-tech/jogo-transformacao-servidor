@@ -18,6 +18,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 import { montarCidade } from './cidade.mjs';
 import { montarPedido, conferirResposta } from './ia.mjs';
 
@@ -463,6 +464,55 @@ async function arquivoWeb(nome) {
   return item;
 }
 
+// ------------------------------------------------------------------ página do jogo (site/)
+// A página (downloads, jogar no navegador, vídeos, manual) fica no banco como os arquivos da web, em partes
+// "site-<caminho>". O endereço principal no navegador mostra a página; o jogo continua recebendo o JSON.
+// Vídeo e imagem vão crus e aceitam Range (o iPhone só toca vídeo assim); texto vai em gzip.
+const TIPOS_SITE = { html: 'text/html; charset=utf-8', css: 'text/css; charset=utf-8', js: 'text/javascript; charset=utf-8',
+  mjs: 'text/javascript; charset=utf-8', json: 'application/json; charset=utf-8', svg: 'image/svg+xml', png: 'image/png',
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', ico: 'image/x-icon', mp4: 'video/mp4',
+  webm: 'video/webm', vtt: 'text/vtt; charset=utf-8', woff2: 'font/woff2', txt: 'text/plain; charset=utf-8', mp3: 'audio/mpeg' };
+const TEXTO_SITE = new Set(['html', 'css', 'js', 'mjs', 'json', 'svg', 'vtt', 'txt']);
+const PASTAS_SITE = ['assets/', 'img/', 'videos/'];
+const cacheSite = new Map();   // caminho -> { buf, gz, etag, tipo }
+const caminhoSite = (p) => /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,160}$/.test(p) && !p.includes('..') && !p.includes('//') &&
+  TIPOS_SITE[p.split('.').pop().toLowerCase()] ? p : null;
+
+async function arquivoSite(caminho) {
+  if (cacheSite.has(caminho)) return cacheSite.get(caminho);
+  const partes = await banco.partes('site-' + caminho);
+  if (!partes.length) return null;
+  const bufs = [];
+  for (const p of partes) bufs.push(await banco.parte('site-' + caminho, p.n));
+  const buf = Buffer.concat(bufs);
+  const ext = caminho.split('.').pop().toLowerCase();
+  const item = { buf, gz: TEXTO_SITE.has(ext) ? zlib.gzipSync(buf, { level: 9 }) : null, tipo: TIPOS_SITE[ext],
+    etag: '"' + crypto.createHash('sha1').update(buf).digest('hex').slice(0, 20) + '"' };
+  cacheSite.set(caminho, item);
+  return item;
+}
+
+function servirSite(req, res, item) {
+  const base = { 'Content-Type': item.tipo, ETag: item.etag, 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' };
+  if (req.headers['if-none-match'] === item.etag) { res.writeHead(304, { ETag: item.etag }); return res.end(); }
+  if (item.gz && /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) {
+    res.writeHead(200, { ...base, 'Content-Encoding': 'gzip', 'Content-Length': item.gz.length, Vary: 'Accept-Encoding' });
+    return res.end(item.gz);
+  }
+  const total = item.buf.length;
+  const faixa = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+  if (faixa && !item.gz) {   // pedaço (vídeo no iPhone/Safari, arrastar o vídeo)
+    let ini = faixa[1] === '' ? total - Number(faixa[2]) : Number(faixa[1]);
+    let fim = faixa[1] === '' || faixa[2] === '' ? total - 1 : Number(faixa[2]);
+    ini = Math.max(0, ini); fim = Math.min(total - 1, fim);
+    if (ini > fim) { res.writeHead(416, { 'Content-Range': 'bytes */' + total }); return res.end(); }
+    res.writeHead(206, { ...base, 'Accept-Ranges': 'bytes', 'Content-Range': `bytes ${ini}-${fim}/${total}`, 'Content-Length': fim - ini + 1 });
+    return res.end(item.buf.subarray(ini, fim + 1));
+  }
+  res.writeHead(200, { ...base, 'Accept-Ranges': 'bytes', 'Content-Length': total });
+  return res.end(item.buf);
+}
+
 function responder(res, cod, obj) {
   res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -529,6 +579,14 @@ http.createServer(async (req, res) => {
         ETag: item.etag, 'Cache-Control': 'no-cache' });
       return res.end(item.buf);
     }
+    // página do jogo: no navegador, o endereço principal (e as páginas e pastas dela); o jogo e o ping recebem JSON
+    if ((req.method === 'GET' || req.method === 'HEAD') && (url === '/' || /^\/[a-z0-9-]+\.html$/.test(url) || PASTAS_SITE.some((p) => url.startsWith('/' + p)))) {
+      const querPagina = url !== '/' || !/application\/json/.test(String(req.headers.accept || ''));   // JSON só para quem pedir JSON (e /saude)
+      const caminho = querPagina ? caminhoSite(url === '/' ? 'index.html' : decodeURIComponent(url.slice(1))) : null;
+      const item = caminho ? await arquivoSite(caminho) : null;
+      if (item) return servirSite(req, res, item);
+      if (url !== '/') return responder(res, 404, { erro: 'nao_achei' });
+    }
     if (req.method === 'GET' && (url === '/' || url === '/saude')) {
       return responder(res, 200, { ok: true, jogo: 'Jogo da Transformação' });
     }
@@ -559,6 +617,16 @@ http.createServer(async (req, res) => {
       await banco.gravarParte('web-' + nome, n, buf);
       cacheWeb.delete(nome);
       return responder(res, 200, { arquivo: nome, parte: n, tamanho: buf.length });
+    }
+    if (req.method === 'POST' && url === '/admin/site') {   // um arquivo da página (site/), em partes de até 8 MB
+      if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
+      const caminho = caminhoSite(String(req.headers['x-arquivo'] || ''));
+      const n = Number(req.headers['x-parte']);
+      if (!caminho || !Number.isInteger(n) || n < 0 || n > 16) return responder(res, 400, { erro: 'arquivo' });
+      const buf = await lerCorpo(req, 9 * 1024 * 1024);
+      await banco.gravarParte('site-' + caminho, n, buf);
+      cacheSite.delete(caminho);
+      return responder(res, 200, { arquivo: caminho, parte: n, tamanho: buf.length });
     }
     if (req.method === 'POST' && url === '/admin/zerar-conta') {   // apaga uma conta, tira da cidade, save do aparelho não volta
       if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
