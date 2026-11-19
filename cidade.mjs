@@ -14,8 +14,8 @@ import { WebSocketServer } from 'ws';
 const LETRAS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // sem 0/O e 1/I
 const CASAS = [1, 2, 3];
 const MAX_PERFIL = 24 * 1024;
-const MAX_CHAT = 40;
-const MAX_TEXTO_CHAT = 200;
+const MAX_CHAT = 100;          // mensagens guardadas por cidade
+const MAX_TEXTO_CHAT = 500;
 
 export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} }) {
   const cache = new Map();     // codigo -> cidade
@@ -89,7 +89,7 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
       pid, casa: m.casa, nome: m.nome || '', perfil: m.perfil || null, parceiro: m.parceiro || null,
       online: aoVivo.has(pid), pos: aoVivo.get(pid)?.pos || null }));
     return { codigo: cid.codigo, eu, casas: CASAS, livres: livres(cid), moradores,
-      pedidos: cid.moradores[eu]?.pedidos || [], chat: cid.chat.slice(-30) };
+      pedidos: cid.moradores[eu]?.pedidos || [], chat: cid.chat.slice(-MAX_CHAT) };
   }
 
   function enviar(ws, obj) { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); }
@@ -272,7 +272,8 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
   function conectou(ws, s) {
     ws.pid = s.pid;
     ws.vivo = true;
-    ws.ultimoChat = 0;
+    ws.balde = 10;           // até 10 mensagens de uma vez (fila que chegou depois de reconectar), repõe 2 por segundo
+    ws.baldeEm = Date.now();
     const antigo = aoVivo.get(s.pid);
     if (antigo && antigo.ws !== ws) antigo.ws.close(4000, 'outro_lugar');
     aoVivo.set(s.pid, { ws, pos: null });
@@ -291,13 +292,21 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
         if (a?.ws === ws) a.pos = pos;
         espalhar(ws.sala, { t: 'pos', pid: ws.pid, ...pos }, ws);
       } else if (m.t === 'chat') {
-        const texto = String(m.texto || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, MAX_TEXTO_CHAT);
-        if (!texto || Date.now() - ws.ultimoChat < 700) return;
-        ws.ultimoChat = Date.now();
-        const msg = { pid: ws.pid, texto, h: Date.now() };
+        const texto = String(m.texto || '').replace(/[\u0000-\u0009\u000b-\u001f]/g, ' ').trim().slice(0, MAX_TEXTO_CHAT);
+        const cidMsg = String(m.cid || '').slice(0, 24);   // id que o jogo deu (confirma a mensagem e evita repetir)
+        if (!texto) return;
         const cid = cache.get(ws.sala);
+        const repetida = cid && cidMsg && cid.chat.find((x) => x.cid === cidMsg && x.pid === ws.pid);
+        if (repetida) { enviar(ws, { t: 'chat', ...repetida }); return; }   // reenvio da fila: só confirma
+        ws.balde = Math.min(10, ws.balde + (Date.now() - ws.baldeEm) / 500);
+        ws.baldeEm = Date.now();
+        if (ws.balde < 1) return;
+        ws.balde -= 1;
+        const msg = { id: crypto.randomBytes(5).toString('hex'), cid: cidMsg, pid: ws.pid, texto, h: Date.now() };
         if (cid) { cid.chat.push(msg); cid.chat = cid.chat.slice(-MAX_CHAT); gravarLogo(cid); }
         espalhar(ws.sala, { t: 'chat', ...msg });
+      } else if (m.t === 'digitando') {
+        espalhar(ws.sala, { t: 'digitando', pid: ws.pid }, ws);
       }
     });
     ws.on('close', () => {
