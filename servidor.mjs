@@ -544,12 +544,18 @@ http.createServer(async (req, res) => {
   cidade.aoUpgrade(req, socket, head).catch(() => socket.destroy());
 }).listen(PORTA, () => console.log(`servidor do jogo na porta ${PORTA} (${process.env.DATABASE_URL ? 'Postgres' : 'arquivos'})`));
 
-// Render grátis dorme depois de 15 min sem acesso. Com MANTER_ACORDADO=1 o próprio servidor se chama a cada
-// 10 min, mas SÓ enquanto alguém usou nos últimos 45 min (jogo aberto: pulso, posição, chat). Assim a cidade
-// online fica viva enquanto tem gente jogando e o servidor dorme quando ninguém joga — sem gastar as 750 h grátis
-// do workspace (que tem outros serviços). Primeiro acesso depois de dormir: ~30-60 s (o jogo espera).
+// Render grátis dorme depois de 15 min sem acesso. Com MANTER_ACORDADO=1 o próprio servidor se chama a cada 10 min:
+//  - SEMPRE dentro do horário HORARIO_ACORDADO (hora de Brasília, "6-24" = das 6h à meia-noite; "0-24" = o dia todo);
+//  - fora dele, só se alguém usou nos últimos 45 min (jogo aberto: pulso, posição, chat).
+// Conta: as 750 h grátis são do workspace inteiro (a luana-api também usa). 6-24 ≈ 560 h/mês e deixa folga;
+// 0-24 = 720-744 h, que estoura com qualquer outro serviço acordado. Primeiro acesso depois de dormir: ~30-60 s.
 if (process.env.RENDER_EXTERNAL_URL && process.env.MANTER_ACORDADO === "1") {
+  const [de, ate] = String(process.env.HORARIO_ACORDADO || '6-24').split('-').map(Number);
   setInterval(() => {
-    if (Date.now() - ultimoUso < 45 * 60 * 1000) fetch(process.env.RENDER_EXTERNAL_URL + '/saude', { headers: { 'x-auto-ping': '1' } }).catch(() => {});
+    const hora = (new Date().getUTCHours() + 21) % 24;   // Brasília = UTC-3
+    const noHorario = de <= ate ? hora >= de && hora < ate : hora >= de || hora < ate;
+    if (noHorario || Date.now() - ultimoUso < 45 * 60 * 1000) {
+      fetch(process.env.RENDER_EXTERNAL_URL + '/saude', { headers: { 'x-auto-ping': '1' } }).catch(() => {});
+    }
   }, 10 * 60 * 1000);
 }
