@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { montarCidade } from './cidade.mjs';
+import { montarPedido, conferirResposta } from './ia.mjs';
 
 const PORTA = Number(process.env.PORT || process.env.PORTA || 8787);
 const MAX_SAVE = 8 * 1024 * 1024;           // 8 MB de save cifrado
@@ -44,7 +45,7 @@ const PROVEDORES = [
       const r = await comTempo(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
         body: JSON.stringify({ system_instruction: { parts: [{ text: sistema }] }, contents: [{ role: 'user', parts: [{ text: texto }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 1500, ...extra } }) }, 30000);
+          generationConfig: { temperature: 0.7, maxOutputTokens: 700, ...extra } }) }, 30000);
       if (!r.ok) continue;
       const j = await r.json();
       const cand = j.candidates?.[0];
@@ -387,18 +388,21 @@ const rotas = {
   },
 
   // análise do dia: só logado, limite por conta por dia
+  // a IA só recebe os dados do jogo (tipo + dados); as instruções ficam no servidor (ia.mjs). Prompt de fora: recusado.
   '/ia': async (b, ip) => {
     const s = await sessaoDe(b);
     if (!s) return [401, { erro: 'sessao' }];
-    if (typeof b.sistema !== 'string' || typeof b.texto !== 'string' || b.texto.length > MAX_IA_TEXTO || b.sistema.length > 8000) {
-      return [400, { erro: 'dados' }];
-    }
+    if ('sistema' in b || 'texto' in b) return [400, { erro: 'atualize' }];   // jogo antigo mandava o prompt: não aceita mais
+    if (JSON.stringify(b.dados || null).length > MAX_IA_TEXTO) return [413, { erro: 'grande' }];
+    const pedido = montarPedido(String(b.tipo || ''), b.dados);
+    if (!pedido) return [400, { erro: 'dados' }];
     if (excedeu(ip, 'ia', IA_POR_DIA * 3)) return [429, { erro: 'limite', por_dia: IA_POR_DIA }];
     const c = s[1];
     const hoje = new Date().toISOString().slice(0, 10);
     if (c.ia_dia !== hoje) { c.ia_dia = hoje; c.ia_n = 0; }
     if (c.ia_n >= IA_POR_DIA) return [429, { erro: 'limite', por_dia: IA_POR_DIA }];
-    const [provedor, texto] = await perguntarIA(b.sistema, b.texto);
+    const [provedor, bruto] = await perguntarIA(pedido.sistema, pedido.texto);
+    const texto = conferirResposta(bruto);
     if (!texto) return [502, { erro: 'ia_indisponivel' }];
     c.ia_n = (c.ia_n || 0) + 1;
     lembrarTexto(s[0], texto);
