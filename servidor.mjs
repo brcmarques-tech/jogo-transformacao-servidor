@@ -38,11 +38,12 @@ async function comTempo(url, opcoes, ms = 45000) {
 const PROVEDORES = [
   ['gemini', async (sistema, texto) => {
     if (!process.env.GEMINI_API_KEY) return null;
-    for (const modelo of ['gemini-flash-latest', 'gemini-3.8-flash']) {
+    // sem "raciocínio" (thinking): era ele que fazia a análise demorar; o lite é o reserva
+    for (const [modelo, extra] of [['gemini-flash-latest', { thinkingConfig: { thinkingBudget: 0 } }], ['gemini-flash-lite-latest', {}]]) {
       const r = await comTempo(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
         body: JSON.stringify({ system_instruction: { parts: [{ text: sistema }] }, contents: [{ role: 'user', parts: [{ text: texto }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 4096 } }) });
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1500, ...extra } }) }, 30000);
       if (!r.ok) continue;
       const j = await r.json();
       const cand = j.candidates?.[0];
@@ -79,6 +80,58 @@ async function perguntarIA(sistema, texto) {
     } catch (e) { console.error('ia', nome, e.message); }
   }
   return [null, null];
+}
+
+// Voz (Gemini TTS): só lê textos que a própria IA daqui escreveu para aquela conta (não vira TTS grátis).
+// Volta PCM 16 bits mono 16 kHz (o Gemini manda 24 kHz; 16 kHz basta para voz e pesa 1/3 a menos).
+const VOZ_MODELOS = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts', 'gemini-2.5-flash-preview-tts'];
+const textosDaIA = new Map();   // conta -> [{ h, texto, t, audio }]
+const hashTexto = (t) => crypto.createHash('sha256').update(String(t).trim()).digest('hex');
+function lembrarTexto(conta, texto) {
+  const l = (textosDaIA.get(conta) || []).filter((x) => Date.now() - x.t < 6 * 3600e3).slice(-4);
+  l.push({ h: hashTexto(texto), texto, t: Date.now() });
+  textosDaIA.set(conta, l);
+}
+
+function pcm16k(buf) {
+  let dados = buf, taxa = 24000;
+  if (buf.slice(0, 4).toString() === 'RIFF') {   // wav: acha o bloco "data"
+    taxa = buf.readUInt32LE(24);
+    let p = 12;
+    while (p + 8 <= buf.length) {
+      const id = buf.slice(p, p + 4).toString(), tam = buf.readUInt32LE(p + 4);
+      if (id === 'data') { dados = buf.slice(p + 8, p + 8 + tam); break; }
+      p += 8 + tam;
+    }
+  }
+  const n = Math.floor(dados.length / 2);
+  if (taxa <= 16000 || n < 4) return dados;
+  const ent = (i) => dados.readInt16LE(Math.min(n - 1, Math.max(0, i)) * 2);
+  const passo = taxa / 16000, m = Math.floor(n / passo), out = Buffer.alloc(m * 2);
+  for (let i = 0; i < m; i++) {
+    const x = i * passo, a = Math.floor(x), f = x - a;
+    const v = (ent(a - 1) + 2 * ent(a) + ent(a + 1)) / 4 * (1 - f) + (ent(a) + 2 * ent(a + 1) + ent(a + 2)) / 4 * f;   // suaviza e interpola
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(v))), i * 2);
+  }
+  return out;
+}
+
+async function falarTexto(texto) {
+  if (!process.env.GEMINI_API_KEY) return null;
+  const limpo = texto.replace(/[*#_•>]/g, ' ').replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '').slice(0, 2500);
+  for (const modelo of VOZ_MODELOS) {
+    try {
+      const r = await comTempo(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+        body: JSON.stringify({ contents: [{ parts: [{ text: 'Leia em português do Brasil, com voz calorosa, calma e animada, como um amigo: ' + limpo }] }],
+          generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } } }) }, 60000);
+      if (!r.ok) { console.error('voz', modelo, r.status); continue; }
+      const j = await r.json();
+      const d = j.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData;
+      if (d?.data) return pcm16k(Buffer.from(d.data, 'base64'));
+    } catch (e) { console.error('voz', modelo, e.message); }
+  }
+  return null;
 }
 
 // ------------------------------------------------------------------ guarda (Postgres ou arquivo)
@@ -314,6 +367,7 @@ const rotas = {
     const [provedor, texto] = await perguntarIA(b.sistema, b.texto);
     if (!texto) return [502, { erro: 'ia_indisponivel' }];
     c.ia_n = (c.ia_n || 0) + 1;
+    lembrarTexto(s[0], texto);
     await banco.gravarDados(s[0], c);
     return [200, { texto, provedor, restam: IA_POR_DIA - c.ia_n }];
   },
@@ -403,6 +457,20 @@ http.createServer(async (req, res) => {
       const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
       await banco.publicar(versao, sha256, buf);
       return responder(res, 200, { versao, sha256, tamanho: buf.length });
+    }
+    // ---- voz da análise (binário)
+    if (req.method === 'POST' && url === '/ia/voz') {
+      let b;
+      try { b = JSON.parse((await lerCorpo(req, 16 * 1024)).toString('utf8') || '{}'); } catch { return responder(res, 400, { erro: 'json' }); }
+      const s = await sessaoDe(b);
+      if (!s) return responder(res, 401, { erro: 'sessao' });
+      if (excedeu(ipDe(req), 'voz', IA_POR_DIA * 4)) return responder(res, 429, { erro: 'limite' });
+      const achado = (textosDaIA.get(s[0]) || []).find((x) => x.h === String(b.hash || ''));
+      if (!achado) return responder(res, 404, { erro: 'texto' });
+      if (!achado.audio) achado.audio = await falarTexto(achado.texto);
+      if (!achado.audio) return responder(res, 502, { erro: 'voz_indisponivel' });
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': achado.audio.length, 'x-taxa': '16000' });
+      return res.end(achado.audio);
     }
     // ---- contas
     const rota = rotas[url];
