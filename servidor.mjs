@@ -347,7 +347,7 @@ const rotas = {
       criada: Date.now(), save: null, versao: 0, erros: 0, bloqueada_ate: 0 };
     const token = novaSessao(c);
     await banco.gravar(id, c);
-    return [200, { token, nova: true }];
+    return [200, { token, nova: true, geracao: (await banco.config('geracao')) || '' }];
   },
 
   '/conta/entrar': async (b, ip) => {
@@ -368,7 +368,7 @@ const rotas = {
     const derrubou = !!c.sessao;
     const token = novaSessao(c);   // a sessão anterior (outro aparelho) deixa de valer
     await banco.gravarDados(id, c);
-    return [200, { token, save: c.save, versao: c.versao, derrubou }];
+    return [200, { token, save: c.save, versao: c.versao, derrubou, geracao: (await banco.config('geracao')) || '' }];
   },
 
   // pulso: a sessão ainda é minha?
