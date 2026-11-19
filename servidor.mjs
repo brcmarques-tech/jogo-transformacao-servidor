@@ -18,6 +18,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { montarCidade } from './cidade.mjs';
 
 const PORTA = Number(process.env.PORT || process.env.PORTA || 8787);
 const MAX_SAVE = 8 * 1024 * 1024;           // 8 MB de save cifrado
@@ -147,6 +148,7 @@ const banco = await (async () => {
       pck bytea not null, publicado timestamptz default now())`);
     await pool.query(`create table if not exists config (chave text primary key, valor text not null)`);
     await pool.query(`create table if not exists instalador_partes (n int primary key, dados bytea not null)`);
+    await pool.query(`create table if not exists cidades (codigo text primary key, dados jsonb not null, atualizado timestamptz default now())`);
     await pool.query(`create table if not exists arquivos_partes (arquivo text not null, n int not null, dados bytea not null, primary key (arquivo, n))`);
     return {
       async conta(id) {
@@ -166,6 +168,18 @@ const banco = await (async () => {
         const r = await pool.query("select id, dados from contas where dados->>'sessao' = $1", [h]);
         return r.rows[0] ? [r.rows[0].id, r.rows[0].dados] : null;
       },
+      async contaDoPid(pid) {
+        const r = await pool.query("select id, dados from contas where dados->>'pid' = $1", [pid]);
+        return r.rows[0] ? [r.rows[0].id, r.rows[0].dados] : null;
+      },
+      async cidadeLer(codigo) {
+        const r = await pool.query('select dados from cidades where codigo = $1', [codigo]);
+        return r.rows[0]?.dados || null;
+      },
+      async cidadeGravar(codigo, dados) {
+        await pool.query('insert into cidades (codigo, dados) values ($1, $2) on conflict (codigo) do update set dados = $2, atualizado = now()', [codigo, dados]);
+      },
+      async cidadeApagar(codigo) { await pool.query('delete from cidades where codigo = $1', [codigo]); },
       async versao() {
         const r = await pool.query('select versao, sha256, tamanho, publicado from atualizacao where id = 1');
         return r.rows[0] || null;
@@ -221,8 +235,28 @@ const banco = await (async () => {
     async gravar(id, c) { contas[id] = { ...c }; salvarArq(); },
     async gravarDados(id, c) { contas[id] = { ...c, save: contas[id]?.save ?? null }; salvarArq(); },
     async porSessao(h) {
-      for (const [id, c] of Object.entries(contas)) if (c.sessao === h) return [id, c];
+      for (const [id, c] of Object.entries(contas)) if (c.sessao === h) return [id, { ...c }];
       return null;
+    },
+    async contaDoPid(pid) {
+      for (const [id, c] of Object.entries(contas)) if (c.pid === pid) return [id, { ...c }];
+      return null;
+    },
+    async cidadeLer(codigo) {
+      const a = path.join(PASTA, 'cidades.json');
+      return fs.existsSync(a) ? (JSON.parse(fs.readFileSync(a, 'utf8'))[codigo] ?? null) : null;
+    },
+    async cidadeGravar(codigo, dados) {
+      const a = path.join(PASTA, 'cidades.json');
+      const c = fs.existsSync(a) ? JSON.parse(fs.readFileSync(a, 'utf8')) : {};
+      c[codigo] = dados;
+      fs.writeFileSync(a, JSON.stringify(c));
+    },
+    async cidadeApagar(codigo) {
+      const a = path.join(PASTA, 'cidades.json');
+      const c = fs.existsSync(a) ? JSON.parse(fs.readFileSync(a, 'utf8')) : {};
+      delete c[codigo];
+      fs.writeFileSync(a, JSON.stringify(c));
     },
     async versao() { return fs.existsSync(ARQ_V) ? JSON.parse(fs.readFileSync(ARQ_V, 'utf8')) : null; },
     async pck() { const p = path.join(PASTA, 'jogo.pck'); return fs.existsSync(p) ? fs.readFileSync(p) : null; },
@@ -379,6 +413,9 @@ const rotas = {
   },
 };
 
+const cidade = montarCidade({ banco, sessaoDe, excedeu });
+Object.assign(rotas, cidade.rotas);
+
 function responder(res, cod, obj) {
   res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -484,6 +521,8 @@ http.createServer(async (req, res) => {
     console.error(e);
     if (!res.headersSent) responder(res, 500, { erro: 'interno' });
   }
+}).on('upgrade', (req, socket, head) => {
+  cidade.aoUpgrade(req, socket, head).catch(() => socket.destroy());
 }).listen(PORTA, () => console.log(`servidor do jogo na porta ${PORTA} (${process.env.DATABASE_URL ? 'Postgres' : 'arquivos'})`));
 
 // Render grátis dorme sem acesso. Com MANTER_ACORDADO=1 o próprio servidor se chama a cada 10 min
