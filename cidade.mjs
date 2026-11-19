@@ -14,7 +14,8 @@ import { WebSocketServer } from 'ws';
 const LETRAS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // sem 0/O e 1/I
 const CASAS = [1, 2, 3];
 const MAX_PERFIL = 24 * 1024;
-const MAX_CHAT = 100;          // mensagens guardadas por cidade
+const MAX_CHAT = 100;          // mensagens guardadas por cidade (grupo)
+const MAX_PARTICULAR = 300;    // mensagens particulares guardadas por cidade (todas as conversas juntas)
 const MAX_TEXTO_CHAT = 500;
 
 export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} }) {
@@ -89,7 +90,8 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
       pid, casa: m.casa, nome: m.nome || '', perfil: m.perfil || null, parceiro: m.parceiro || null,
       online: aoVivo.has(pid), pos: aoVivo.get(pid)?.pos || null }));
     return { codigo: cid.codigo, eu, casas: CASAS, livres: livres(cid), moradores,
-      pedidos: cid.moradores[eu]?.pedidos || [], chat: cid.chat.slice(-MAX_CHAT) };
+      pedidos: cid.moradores[eu]?.pedidos || [], chat: cid.chat.slice(-MAX_CHAT),
+      particular: (cid.particular || []).filter((x) => x.pid === eu || x.para === eu) };
   }
 
   function enviar(ws, obj) { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); }
@@ -114,6 +116,7 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
   // tira o morador da cidade; cidade vazia some
   async function tirar(cid, pid) {
     delete cid.moradores[pid];
+    if (cid.particular) cid.particular = cid.particular.filter((x) => x.pid !== pid && x.para !== pid);
     for (const m of Object.values(cid.moradores)) m.pedidos = (m.pedidos || []).filter((p) => p !== pid);
     espalhar(cid.codigo, { t: 'saiu', pid });
     if (!Object.keys(cid.moradores).length) {
@@ -296,17 +299,33 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
         const cidMsg = String(m.cid || '').slice(0, 24);   // id que o jogo deu (confirma a mensagem e evita repetir)
         if (!texto) return;
         const cid = cache.get(ws.sala);
-        const repetida = cid && cidMsg && cid.chat.find((x) => x.cid === cidMsg && x.pid === ws.pid);
+        // particular: "para" tem que morar na cidade e não ser eu; só os dois recebem (e só os dois veem no histórico)
+        const para = String(m.para || '').slice(0, 12);
+        if (para && (!cid || !cid.moradores[para] || para === ws.pid)) return;
+        const lista = para ? (cid ? (cid.particular ||= []) : []) : (cid ? cid.chat : []);
+        const repetida = cidMsg && lista.find((x) => x.cid === cidMsg && x.pid === ws.pid);
         if (repetida) { enviar(ws, { t: 'chat', ...repetida }); return; }   // reenvio da fila: só confirma
         ws.balde = Math.min(10, ws.balde + (Date.now() - ws.baldeEm) / 500);
         ws.baldeEm = Date.now();
         if (ws.balde < 1) return;
         ws.balde -= 1;
         const msg = { id: crypto.randomBytes(5).toString('hex'), cid: cidMsg, pid: ws.pid, texto, h: Date.now() };
+        if (para) {
+          msg.para = para;
+          if (cid) { cid.particular.push(msg); cid.particular = cid.particular.slice(-MAX_PARTICULAR); gravarLogo(cid); }
+          enviar(ws, { t: 'chat', ...msg });
+          const dele = aoVivo.get(para);
+          if (dele && dele.ws !== ws && dele.ws.sala === ws.sala) enviar(dele.ws, { t: 'chat', ...msg });
+          return;
+        }
         if (cid) { cid.chat.push(msg); cid.chat = cid.chat.slice(-MAX_CHAT); gravarLogo(cid); }
         espalhar(ws.sala, { t: 'chat', ...msg });
       } else if (m.t === 'digitando') {
-        espalhar(ws.sala, { t: 'digitando', pid: ws.pid }, ws);
+        const para = String(m.para || '').slice(0, 12);
+        if (para) {
+          const dele = aoVivo.get(para);
+          if (dele && dele.ws.sala === ws.sala) enviar(dele.ws, { t: 'digitando', pid: ws.pid, para });
+        } else espalhar(ws.sala, { t: 'digitando', pid: ws.pid }, ws);
       }
     });
     ws.on('close', () => {
