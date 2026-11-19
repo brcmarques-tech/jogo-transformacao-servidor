@@ -124,7 +124,7 @@ async function falarTexto(texto) {
     try {
       const r = await comTempo(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-        body: JSON.stringify({ contents: [{ parts: [{ text: 'Leia em português do Brasil, com voz calorosa, calma e animada, como um amigo: ' + limpo }] }],
+        body: JSON.stringify({ contents: [{ parts: [{ text: limpo }] }],   // só o texto: o modelo lite lia a instrução em voz alta
           generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } } }) }, 60000);
       if (!r.ok) { console.error('voz', modelo, r.status); continue; }
       const j = await r.json();
