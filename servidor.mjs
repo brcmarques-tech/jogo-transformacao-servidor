@@ -430,6 +430,26 @@ function versaoMenor(a, b) {
   return false;
 }
 
+// ------------------------------------------------------------------ versão web (/jogar)
+// Os arquivos do export Web do Godot ficam no banco (como os instaladores), já em gzip. Servidos do mesmo endereço
+// da API: o navegador não bloqueia os pedidos do jogo (mesma origem). Cache na memória + ETag (o navegador revalida).
+const TIPOS_WEB = { html: 'text/html; charset=utf-8', js: 'text/javascript', wasm: 'application/wasm', pck: 'application/octet-stream',
+  png: 'image/png', json: 'application/manifest+json' };
+const cacheWeb = new Map();   // nome -> { buf (gzip), etag }
+const nomeWeb = (n) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/.test(n) && TIPOS_WEB[n.split('.').pop()] ? n : null;
+
+async function arquivoWeb(nome) {
+  if (cacheWeb.has(nome)) return cacheWeb.get(nome);
+  const partes = await banco.partes('web-' + nome);
+  if (!partes.length) return null;
+  const bufs = [];
+  for (const p of partes) bufs.push(await banco.parte('web-' + nome, p.n));
+  const buf = Buffer.concat(bufs);
+  const item = { buf, etag: '"' + crypto.createHash('sha1').update(buf).digest('hex').slice(0, 20) + '"' };
+  cacheWeb.set(nome, item);
+  return item;
+}
+
 function responder(res, cod, obj) {
   res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -486,6 +506,16 @@ http.createServer(async (req, res) => {
       }
       return res.end();
     }
+    if (req.method === 'GET' && (url === '/jogar' || url.startsWith('/jogar/'))) {
+      if (url === '/jogar') { res.writeHead(301, { Location: '/jogar/' }); return res.end(); }
+      const nome = nomeWeb(url.slice('/jogar/'.length) || 'index.html');
+      const item = nome ? await arquivoWeb(nome) : null;
+      if (!item) return responder(res, 404, { erro: 'nao_achei' });
+      if (req.headers['if-none-match'] === item.etag) { res.writeHead(304, { ETag: item.etag }); return res.end(); }
+      res.writeHead(200, { 'Content-Type': TIPOS_WEB[nome.split('.').pop()], 'Content-Encoding': 'gzip', 'Content-Length': item.buf.length,
+        ETag: item.etag, 'Cache-Control': 'no-cache' });
+      return res.end(item.buf);
+    }
     if (req.method === 'GET' && (url === '/' || url === '/saude')) {
       return responder(res, 200, { ok: true, jogo: 'Jogo da Transformação' });
     }
@@ -506,6 +536,16 @@ http.createServer(async (req, res) => {
       const versao = String(req.headers['x-versao'] || '');
       if (n === 0 && /^[0-9]+(\.[0-9]+)*$/.test(versao)) await banco.definirConfig('versao_' + arquivo, versao);
       return responder(res, 200, { parte: n, tamanho: buf.length });
+    }
+    if (req.method === 'POST' && url === '/admin/web') {   // um arquivo do export Web (já em gzip), em partes de até 8 MB
+      if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
+      const nome = nomeWeb(String(req.headers['x-arquivo'] || ''));
+      const n = Number(req.headers['x-parte']);
+      if (!nome || !Number.isInteger(n) || n < 0 || n > 16) return responder(res, 400, { erro: 'arquivo' });
+      const buf = await lerCorpo(req, 9 * 1024 * 1024);
+      await banco.gravarParte('web-' + nome, n, buf);
+      cacheWeb.delete(nome);
+      return responder(res, 200, { arquivo: nome, parte: n, tamanho: buf.length });
     }
     if (req.method === 'POST' && url === '/admin/atualizacao') {
       if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
