@@ -17,7 +17,7 @@ const MAX_PERFIL = 24 * 1024;
 const MAX_CHAT = 40;
 const MAX_TEXTO_CHAT = 200;
 
-export function montarCidade({ banco, sessaoDe, excedeu }) {
+export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} }) {
   const cache = new Map();     // codigo -> cidade
   const travas = new Map();    // codigo -> Promise (uma alteração por vez em cada cidade)
   const salas = new Map();     // codigo -> Set(ws)
@@ -281,6 +281,7 @@ export function montarCidade({ banco, sessaoDe, excedeu }) {
     espalhar(s.cid.codigo, { t: 'entrou', pid: s.pid }, ws);
     ws.on('pong', () => { ws.vivo = true; });
     ws.on('message', (dados) => {
+      marcarUso();
       let m;
       try { m = JSON.parse(dados.toString('utf8')); } catch { return; }
       if (m.t === 'pos') {

@@ -413,7 +413,8 @@ const rotas = {
   },
 };
 
-const cidade = montarCidade({ banco, sessaoDe, excedeu });
+let ultimoUso = Date.now();   // último pedido de verdade (o auto-ping não conta)
+const cidade = montarCidade({ banco, sessaoDe, excedeu, marcarUso: () => { ultimoUso = Date.now(); } });
 Object.assign(rotas, cidade.rotas);
 
 // "48" < "49", "1.10" > "1.9"
@@ -444,6 +445,7 @@ function lerCorpo(req, max) {
 }
 
 http.createServer(async (req, res) => {
+  if (!req.headers['x-auto-ping']) ultimoUso = Date.now();
   try {
     const url = req.url.split('?')[0];
     // ---- atualização do jogo (público)
@@ -542,9 +544,12 @@ http.createServer(async (req, res) => {
   cidade.aoUpgrade(req, socket, head).catch(() => socket.destroy());
 }).listen(PORTA, () => console.log(`servidor do jogo na porta ${PORTA} (${process.env.DATABASE_URL ? 'Postgres' : 'arquivos'})`));
 
-// Render grátis dorme sem acesso. Com MANTER_ACORDADO=1 o próprio servidor se chama a cada 10 min
-// (gasta as 750 h grátis do workspace inteiro; por padrão fica desligado: os dados estão no Postgres,
-// dormir só deixa o primeiro login mais lento).
+// Render grátis dorme depois de 15 min sem acesso. Com MANTER_ACORDADO=1 o próprio servidor se chama a cada
+// 10 min, mas SÓ enquanto alguém usou nos últimos 45 min (jogo aberto: pulso, posição, chat). Assim a cidade
+// online fica viva enquanto tem gente jogando e o servidor dorme quando ninguém joga — sem gastar as 750 h grátis
+// do workspace (que tem outros serviços). Primeiro acesso depois de dormir: ~30-60 s (o jogo espera).
 if (process.env.RENDER_EXTERNAL_URL && process.env.MANTER_ACORDADO === "1") {
-  setInterval(() => { fetch(process.env.RENDER_EXTERNAL_URL + '/saude').catch(() => {}); }, 10 * 60 * 1000);
+  setInterval(() => {
+    if (Date.now() - ultimoUso < 45 * 60 * 1000) fetch(process.env.RENDER_EXTERNAL_URL + '/saude', { headers: { 'x-auto-ping': '1' } }).catch(() => {});
+  }, 10 * 60 * 1000);
 }
