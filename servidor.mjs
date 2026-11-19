@@ -169,6 +169,11 @@ const banco = await (async () => {
         const r = await pool.query("select id, dados from contas where dados->>'sessao' = $1", [h]);
         return r.rows[0] ? [r.rows[0].id, r.rows[0].dados] : null;
       },
+      async contasComInicio(ini) {
+        const r = await pool.query('select id from contas where left(id, $2) = $1', [ini, ini.length]);
+        return r.rows.map((x) => x.id);
+      },
+      async apagarConta(id) { await pool.query('delete from contas where id = $1', [id]); },
       async contaDoPid(pid) {
         const r = await pool.query("select id, dados from contas where dados->>'pid' = $1", [pid]);
         return r.rows[0] ? [r.rows[0].id, r.rows[0].dados] : null;
@@ -239,6 +244,8 @@ const banco = await (async () => {
       for (const [id, c] of Object.entries(contas)) if (c.sessao === h) return [id, { ...c }];
       return null;
     },
+    async contasComInicio(ini) { return Object.keys(contas).filter((id) => id.startsWith(ini)); },
+    async apagarConta(id) { delete contas[id]; salvarArq(); },
     async contaDoPid(pid) {
       for (const [id, c] of Object.entries(contas)) if (c.pid === pid) return [id, { ...c }];
       return null;
@@ -331,6 +338,12 @@ async function sessaoDe(corpo) {
   return banco.porSessao(hashToken(corpo.token));
 }
 
+// "geração" das contas: muda quando o servidor é zerado (save do aparelho de antes não é adotado ao entrar).
+// Uma conta zerada sozinha (/admin/zerar-conta) tem a geração dela em config "geracao:<id>".
+async function geracaoDe(id) {
+  return (await banco.config('geracao:' + id)) || (await banco.config('geracao')) || '';
+}
+
 const rotas = {
   '/conta/existe': async (b, ip) => {
     if (!valido(b.conta)) return [400, { erro: 'conta' }];
@@ -348,7 +361,7 @@ const rotas = {
       criada: Date.now(), save: null, versao: 0, erros: 0, bloqueada_ate: 0 };
     const token = novaSessao(c);
     await banco.gravar(id, c);
-    return [200, { token, nova: true, geracao: (await banco.config('geracao')) || '' }];
+    return [200, { token, nova: true, geracao: await geracaoDe(id) }];
   },
 
   '/conta/entrar': async (b, ip) => {
@@ -369,7 +382,7 @@ const rotas = {
     const derrubou = !!c.sessao;
     const token = novaSessao(c);   // a sessão anterior (outro aparelho) deixa de valer
     await banco.gravarDados(id, c);
-    return [200, { token, save: c.save, versao: c.versao, derrubou, geracao: (await banco.config('geracao')) || '' }];
+    return [200, { token, save: c.save, versao: c.versao, derrubou, geracao: await geracaoDe(id) }];
   },
 
   // pulso: a sessão ainda é minha?
@@ -546,6 +559,20 @@ http.createServer(async (req, res) => {
       await banco.gravarParte('web-' + nome, n, buf);
       cacheWeb.delete(nome);
       return responder(res, 200, { arquivo: nome, parte: n, tamanho: buf.length });
+    }
+    if (req.method === 'POST' && url === '/admin/zerar-conta') {   // apaga uma conta, tira da cidade, save do aparelho não volta
+      if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });
+      let b;
+      try { b = JSON.parse((await lerCorpo(req, 4096)).toString('utf8') || '{}'); } catch { return responder(res, 400, { erro: 'json' }); }
+      const ini = String(b.inicio || '');
+      if (!/^[0-9a-f]{10,64}$/.test(ini)) return responder(res, 400, { erro: 'inicio' });
+      const ids = await banco.contasComInicio(ini);
+      if (ids.length !== 1) return responder(res, 404, { erro: 'achou_' + ids.length });
+      const c = await banco.conta(ids[0]);
+      if (c.pid) await cidade.expulsar(c.pid, c.cidade);
+      await banco.definirConfig('geracao:' + ids[0], 'zerada-' + Date.now());
+      await banco.apagarConta(ids[0]);
+      return responder(res, 200, { ok: true, cidade: c.cidade || '' });
     }
     if (req.method === 'POST' && url === '/admin/atualizacao') {
       if (!ehAdmin()) return responder(res, 403, { erro: 'admin' });

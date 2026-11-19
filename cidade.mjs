@@ -328,5 +328,13 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
     }
   }, 25000).unref();
 
-  return { rotas, aoUpgrade, garantir };
+  // conta apagada (admin): sai da cidade e a conexão ao vivo cai
+  async function expulsar(pid, codigo) {
+    const viva = aoVivo.get(pid);
+    if (viva && viva.ws) try { viva.ws.close(); } catch { /* já fechou */ }
+    if (!codigo) return;
+    await comTrava(codigo, async () => { const cid = await ler(codigo); if (cid && cid.moradores[pid]) await tirar(cid, pid); });
+  }
+
+  return { rotas, aoUpgrade, garantir, expulsar };
 }
