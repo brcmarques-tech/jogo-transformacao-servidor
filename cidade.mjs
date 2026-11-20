@@ -22,7 +22,8 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
   const cache = new Map();     // codigo -> cidade
   const travas = new Map();    // codigo -> Promise (uma alteração por vez em cada cidade)
   const salas = new Map();     // codigo -> Set(ws)
-  const aoVivo = new Map();    // pid -> { ws, pos }
+  const aoVivo = new Map();    // pid -> { conns: Set(ws), pos } — a mesma conta pode estar aberta em vários aparelhos
+  const conexoes = (pid) => [...(aoVivo.get(pid)?.conns || [])];
   const gravarDepois = new Map();
 
   const novoPid = () => crypto.randomBytes(6).toString('hex');
@@ -181,8 +182,8 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
         await gravar(d);
         s.c.cidade = codigo;
         await banco.gravarDados(s.id, s.c);
-        const ws = aoVivo.get(s.pid)?.ws;
-        if (ws) { mudarDeSala(ws, codigo); aoVivo.get(s.pid).pos = null; }
+        for (const ws of conexoes(s.pid)) mudarDeSala(ws, codigo);
+        if (aoVivo.has(s.pid)) aoVivo.get(s.pid).pos = null;
         return [200, null];
       });
       if (r[0] !== 200) return r;
@@ -222,8 +223,7 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
             const conta = pid === s.pid ? [s.id, s.c] : await banco.contaDoPid(pid);
             if (conta) { conta[1].cidade = nova.codigo; await banco.gravarDados(conta[0], conta[1]); }
             delete cid.moradores[pid];
-            const ws = aoVivo.get(pid)?.ws;
-            if (ws) { mudarDeSala(ws, nova.codigo); enviar(ws, { t: 'cidade', ...vista(nova, pid) }); }
+            for (const ws of conexoes(pid)) { mudarDeSala(ws, nova.codigo); enviar(ws, { t: 'cidade', ...vista(nova, pid) }); }
           }
           await gravar(cid);
           avisarCidade(cid);
@@ -277,12 +277,12 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
     ws.vivo = true;
     ws.balde = 10;           // até 10 mensagens de uma vez (fila que chegou depois de reconectar), repõe 2 por segundo
     ws.baldeEm = Date.now();
-    const antigo = aoVivo.get(s.pid);
-    if (antigo && antigo.ws !== ws) antigo.ws.close(4000, 'outro_lugar');
-    aoVivo.set(s.pid, { ws, pos: null });
+    const primeiro = !aoVivo.has(s.pid);
+    if (primeiro) aoVivo.set(s.pid, { conns: new Set(), pos: null });
+    aoVivo.get(s.pid).conns.add(ws);   // outro aparelho da mesma conta: os dois ficam conectados
     mudarDeSala(ws, s.cid.codigo);
     enviar(ws, { t: 'cidade', ...vista(s.cid, s.pid) });
-    espalhar(s.cid.codigo, { t: 'entrou', pid: s.pid }, ws);
+    if (primeiro) espalhar(s.cid.codigo, { t: 'entrou', pid: s.pid }, ws);
     ws.on('pong', () => { ws.vivo = true; });
     ws.on('message', (dados) => {
       marcarUso();
@@ -292,7 +292,7 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
         const pos = { cena: String(m.cena || '').slice(0, 20), dono: String(m.dono || '').slice(0, 12),
           x: Number(m.x) || 0, y: Number(m.y) || 0, esc: Number(m.esc) || 1, at: String(m.at || '').slice(0, 30), olha: m.olha === -1 ? -1 : 1, ctl: !!m.ctl };
         const a = aoVivo.get(ws.pid);
-        if (a?.ws === ws) a.pos = pos;
+        if (a) a.pos = pos;
         espalhar(ws.sala, { t: 'pos', pid: ws.pid, ...pos }, ws);
       } else if (m.t === 'chat') {
         const texto = String(m.texto || '').replace(/[\u0000-\u0009\u000b-\u001f]/g, ' ').trim().slice(0, MAX_TEXTO_CHAT);
@@ -313,9 +313,7 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
         if (para) {
           msg.para = para;
           if (cid) { cid.particular.push(msg); cid.particular = cid.particular.slice(-MAX_PARTICULAR); gravarLogo(cid); }
-          enviar(ws, { t: 'chat', ...msg });
-          const dele = aoVivo.get(para);
-          if (dele && dele.ws !== ws && dele.ws.sala === ws.sala) enviar(dele.ws, { t: 'chat', ...msg });
+          for (const c of new Set([ws, ...conexoes(ws.pid), ...conexoes(para)])) if (c.sala === ws.sala) enviar(c, { t: 'chat', ...msg });   // os aparelhos dos dois
           return;
         }
         if (cid) { cid.chat.push(msg); cid.chat = cid.chat.slice(-MAX_CHAT); gravarLogo(cid); }
@@ -323,16 +321,18 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
       } else if (m.t === 'digitando') {
         const para = String(m.para || '').slice(0, 12);
         if (para) {
-          const dele = aoVivo.get(para);
-          if (dele && dele.ws.sala === ws.sala) enviar(dele.ws, { t: 'digitando', pid: ws.pid, para });
+          for (const c of conexoes(para)) if (c.sala === ws.sala) enviar(c, { t: 'digitando', pid: ws.pid, para });
         } else espalhar(ws.sala, { t: 'digitando', pid: ws.pid }, ws);
       }
     });
     ws.on('close', () => {
       const a = aoVivo.get(ws.pid);
-      if (a?.ws === ws) {
-        aoVivo.delete(ws.pid);
-        espalhar(ws.sala, { t: 'saiu', pid: ws.pid });
+      if (a) {
+        a.conns.delete(ws);
+        if (!a.conns.size) {   // saiu do último aparelho
+          aoVivo.delete(ws.pid);
+          espalhar(ws.sala, { t: 'saiu', pid: ws.pid });
+        }
       }
       salas.get(ws.sala)?.delete(ws);
     });
@@ -349,11 +349,15 @@ export function montarCidade({ banco, sessaoDe, excedeu, marcarUso = () => {} })
 
   // conta apagada (admin): sai da cidade e a conexão ao vivo cai
   async function expulsar(pid, codigo) {
-    const viva = aoVivo.get(pid);
-    if (viva && viva.ws) try { viva.ws.close(); } catch { /* já fechou */ }
+    for (const ws of conexoes(pid)) try { ws.close(); } catch { /* já fechou */ }
     if (!codigo) return;
     await comTrava(codigo, async () => { const cid = await ler(codigo); if (cid && cid.moradores[pid]) await tirar(cid, pid); });
   }
 
-  return { rotas, aoUpgrade, garantir, expulsar };
+  // o save da conta mudou (outro aparelho salvou): cada aparelho aberto busca a versão nova
+  function avisarSave(pid, versao) {
+    for (const ws of conexoes(pid)) enviar(ws, { t: 'save', versao });
+  }
+
+  return { rotas, aoUpgrade, garantir, expulsar, avisarSave };
 }

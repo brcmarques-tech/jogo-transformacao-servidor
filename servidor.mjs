@@ -167,7 +167,7 @@ const banco = await (async () => {
         await pool.query('update contas set dados = $2 where id = $1', [id, dados]);
       },
       async porSessao(h) {
-        const r = await pool.query("select id, dados from contas where dados->>'sessao' = $1", [h]);
+        const r = await pool.query("select id, dados from contas where dados->>'sessao' = $1 or dados->'sessoes' ? $1", [h]);
         return r.rows[0] ? [r.rows[0].id, r.rows[0].dados] : null;
       },
       async contasComInicio(ini) {
@@ -242,7 +242,7 @@ const banco = await (async () => {
     async gravar(id, c) { contas[id] = { ...c }; salvarArq(); },
     async gravarDados(id, c) { contas[id] = { ...c, save: contas[id]?.save ?? null }; salvarArq(); },
     async porSessao(h) {
-      for (const [id, c] of Object.entries(contas)) if (c.sessao === h) return [id, { ...c }];
+      for (const [id, c] of Object.entries(contas)) if (c.sessao === h || (c.sessoes || []).includes(h)) return [id, { ...c }];
       return null;
     },
     async contasComInicio(ini) { return Object.keys(contas).filter((id) => id.startsWith(ini)); },
@@ -314,9 +314,12 @@ function verificar(c, verificador) {
   return crypto.timingSafeEqual(h, Buffer.from(c.verif, 'hex'));
 }
 
+const MAX_SESSOES = 8;   // a conta fica aberta em vários aparelhos ao mesmo tempo (celular, PC, navegador...)
 function novaSessao(c) {
   const token = crypto.randomBytes(32).toString('hex');
-  c.sessao = hashToken(token);
+  const h = hashToken(token);
+  c.sessoes = [...(c.sessoes || (c.sessao ? [c.sessao] : [])).filter((x) => x !== h), h].slice(-MAX_SESSOES);
+  c.sessao = h;   // a última (servidores e jogos antigos)
   c.sessao_desde = Date.now();
   return token;
 }
@@ -380,24 +383,40 @@ const rotas = {
       return [401, { erro: 'pin', restam: Math.max(0, ERROS_ATE_BLOQUEAR - c.erros) }];
     }
     c.erros = 0; c.bloqueada_ate = 0;
-    const derrubou = !!c.sessao;
-    const token = novaSessao(c);   // a sessão anterior (outro aparelho) deixa de valer
+    const derrubou = false;   // entrar noutro aparelho não derruba mais este: a conta fica aberta nos dois e sincroniza
+    const token = novaSessao(c);
     await banco.gravarDados(id, c);
-    return [200, { token, save: c.save, versao: c.versao, derrubou, geracao: await geracaoDe(id) }];
+    return [200, { token, save: c.save, versao: c.versao, mexido: c.mexido || 0, derrubou, geracao: await geracaoDe(id) }];
   },
 
   // pulso: a sessão ainda é minha?
-  '/sessao': async (b) => ((await sessaoDe(b)) ? [200, { ok: true }] : [401, { erro: 'outro_lugar' }]),
+  // devolve também a versão do save na nuvem: o jogo baixa quando outro aparelho salvou algo mais novo
+  '/sessao': async (b) => {
+    const s = await sessaoDe(b);
+    return s ? [200, { ok: true, versao: s[1].versao || 0, mexido: s[1].mexido || 0 }] : [401, { erro: 'outro_lugar' }];
+  },
+
+  // o save mais novo da nuvem (outro aparelho mexeu)
+  '/save/baixar': async (b) => {
+    const s = await sessaoDe(b);
+    if (!s) return [401, { erro: 'outro_lugar' }];
+    const c = await banco.conta(s[0]);
+    return [200, { save: c.save, versao: c.versao || 0, mexido: c.mexido || 0 }];
+  },
 
   '/save': async (b) => {
     const s = await sessaoDe(b);
     if (!s) return [401, { erro: 'outro_lugar' }];
     if (typeof b.save !== 'string' || b.save.length > MAX_SAVE) return [400, { erro: 'save' }];
     const c = await banco.conta(s[0]);
+    const mexido = Number(b.mexido) || 0;   // hora da última mexida do jogador (não do relógio do jogo)
+    if (mexido && (c.mexido || 0) > mexido) return [409, { erro: 'nuvem_mais_nova', versao: c.versao, mexido: c.mexido }];   // outro aparelho mexeu depois
     c.save = b.save;
     c.versao = (c.versao || 0) + 1;
     c.salvo_em = Date.now();
+    if (mexido) c.mexido = mexido;
     await banco.gravar(s[0], c);
+    if (c.pid) cidade.avisarSave(c.pid, c.versao);
     return [200, { versao: c.versao }];
   },
 
@@ -426,7 +445,12 @@ const rotas = {
 
   '/sair': async (b) => {
     const s = await sessaoDe(b);
-    if (s) { const c = s[1]; c.sessao = null; await banco.gravarDados(s[0], c); }
+    if (s) {
+      const c = s[1], h = hashToken(b.token);
+      c.sessoes = (c.sessoes || []).filter((x) => x !== h);
+      if (c.sessao === h) c.sessao = c.sessoes[c.sessoes.length - 1] || null;
+      await banco.gravarDados(s[0], c);
+    }
     return [200, { ok: true }];
   },
 };
@@ -513,6 +537,8 @@ function servirSite(req, res, item) {
   return res.end(item.buf);
 }
 
+const aparelhosVistos = [];   // últimos 50 pedidos de atualização: sistema e versões (diagnóstico do APK preso em versão velha)
+
 function responder(res, cod, obj) {
   res.writeHead(cod, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
@@ -536,7 +562,16 @@ http.createServer(async (req, res) => {
   try {
     const url = req.url.split('?')[0];
     // ---- atualização do jogo (público)
+    if (req.method === 'GET' && url === '/aparelhos-admin') {   // diagnóstico: que versão cada aparelho roda (sem dado pessoal)
+      const admin = process.env.ADMIN || '', veio = String(req.headers['x-admin'] || '');
+      if (!admin || veio.length !== admin.length || !crypto.timingSafeEqual(Buffer.from(veio), Buffer.from(admin))) return responder(res, 403, { erro: 'admin' });
+      return responder(res, 200, { aparelhos: aparelhosVistos });
+    }
     if (req.method === 'GET' && url === '/atualizacao') {
+      { const q = new URL(req.url, 'http://x').searchParams, ua = String(req.headers['user-agent'] || '');
+        aparelhosVistos.unshift({ quando: new Date().toISOString(), sistema: /android/i.test(ua) ? 'android' : /windows/i.test(ua) ? 'windows' : 'outro',
+          apk: q.get('apk') || '', rodando: q.get('usando') || '', jogo: q.get('jogo') || '(jogo antigo: não manda)' });
+        aparelhosVistos.length = Math.min(aparelhosVistos.length, 50); }
       const v = await banco.versao();
       const android = (await banco.config('versao_android')) || '';   // versão do .apk publicado (pode ser mais velha que o pacote)
       // Pacote que precisa de APK novo (ex.: autoload novo): celular com APK mais velho não baixa o pacote,
